@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import List, Tuple
 
@@ -11,21 +12,36 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import cv2
 import numpy as np
-import tensorflow as tf
-
-logging.getLogger("tensorflow").setLevel(logging.ERROR)
-tf.get_logger().setLevel("ERROR")
 
 _model = None
+_tensorflow = None
+_model_lock = threading.Lock()
+
+
+def _load_tensorflow():
+    """Import TensorFlow only when the CNN is actually needed."""
+    global _tensorflow
+    if _tensorflow is None:
+        import tensorflow as tf
+
+        logging.getLogger("tensorflow").setLevel(logging.ERROR)
+        tf.get_logger().setLevel("ERROR")
+        _tensorflow = tf
+    return _tensorflow
 
 
 def load_ocr_model():
     """Load the EMNIST CNN lazily as a process-wide singleton."""
     global _model
-    if _model is None:
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is not None:
+            return _model
         model_path = Path(__file__).resolve().parents[1] / "trained_model" / "ocr_model.keras"
         if not model_path.exists():
             raise FileNotFoundError(f"Trained OCR model not found at {model_path}")
+        tf = _load_tensorflow()
         _model = tf.keras.models.load_model(str(model_path))
     return _model
 
@@ -76,4 +92,3 @@ def predict_character(char_crop: np.ndarray, model) -> str:
     """Backward-compatible single-character prediction wrapper."""
     predictions = predict_characters([char_crop], model)
     return predictions[0][0] if predictions else ""
-

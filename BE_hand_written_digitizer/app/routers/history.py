@@ -1,12 +1,11 @@
-from fastapi import APIRouter, Depends, status, HTTPException
+from fastapi import APIRouter, Depends, status, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List
-import models
-import schemas
-import security
-from utils.document_composer import generate_docx, generate_pdf
-from services.summarization import summarize_document
+from .. import models, schemas, security
+from ..services.summarization import summarize_document
+from ..services.cloudinary_assets import delete_document_assets
+from ..utils.document_composer import generate_docx, generate_pdf
 
 router = APIRouter(prefix="/history", tags=["history"])
 
@@ -30,6 +29,45 @@ def get_user_history(
     if changed:
         db.commit()
     return history_records
+
+
+@router.delete("/{history_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_document(
+    history_id: int,
+    current_user: models.User = Depends(security.get_current_user),
+    db: Session = Depends(security.get_db),
+):
+    history_record = (
+        db.query(models.History)
+        .filter(
+            models.History.id == history_id,
+            models.History.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not history_record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+
+    asset_urls = [history_record.image_url, history_record.overlay_image_url]
+    asset_urls.extend(region.image_url for region in history_record.segmented_regions)
+
+    try:
+        # Keep the database row when remote cleanup fails so deletion can be
+        # retried without leaving an untracked Cloudinary document behind.
+        delete_document_assets(asset_urls)
+        db.delete(history_record)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not delete document assets: {exc}",
+        ) from exc
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.get("/{history_id}/export/{export_format}")
 def export_document(

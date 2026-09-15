@@ -72,11 +72,43 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
     binary_clean = cv2.bitwise_and(binary, cv2.bitwise_not(ruled_lines))
 
     # Adaptive thresholding keeps pale notebook rules as foreground under
-    # uneven lighting. Keep only dark handwriting/diagram ink so horizontal
-    # projection can split real text lines for the handwriting recognizer.
+    # uneven lighting. Keep dark handwriting/diagram ink, but also preserve
+    # pencil strokes that are locally darker than their illuminated paper.
     dark_ink_threshold = int(os.getenv("OCR_DARK_INK_THRESHOLD", "150"))
     dark_ink = cv2.threshold(gray, dark_ink_threshold, 255, cv2.THRESH_BINARY_INV)[1]
-    binary_clean = cv2.bitwise_and(binary_clean, dark_ink)
+    illumination_sigma = max(7.0, cols / 55.0)
+    estimated_paper = cv2.GaussianBlur(gray, (0, 0), illumination_sigma)
+    local_darkness = cv2.subtract(estimated_paper, gray)
+    local_contrast_threshold = int(
+        os.getenv("OCR_LOCAL_INK_CONTRAST", "14")
+    )
+    local_ink = cv2.threshold(
+        local_darkness,
+        local_contrast_threshold,
+        255,
+        cv2.THRESH_BINARY,
+    )[1]
+
+    # Grayscale thresholds discard light blue/purple ballpoint writing such as
+    # the prose in phone photographs under bright lighting. Preserve saturated
+    # blue-to-purple ink independently of brightness. Red notebook margins and
+    # neutral gray page rules are outside this hue range.
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    colored_ink = cv2.inRange(
+        hsv,
+        np.array([72, 32, 20], dtype=np.uint8),
+        np.array([158, 255, 250], dtype=np.uint8),
+    )
+    # Saturated pen pixels may be locally brighter than their paper
+    # background, so adaptive thresholding can miss them completely. Add them
+    # back rather than merely using them as a gate on the adaptive mask.
+    binary_clean = cv2.bitwise_or(
+        cv2.bitwise_and(
+            binary_clean,
+            cv2.bitwise_or(dark_ink, local_ink),
+        ),
+        colored_ink,
+    )
 
     # Morphological opening only finds perfectly horizontal rules. Phone
     # photos contain slightly slanted/curved notebook lines, so detect their
@@ -108,7 +140,37 @@ def preprocess_image(image: np.ndarray) -> np.ndarray:
         strong_ink = cv2.threshold(
             gray, strong_ink_threshold, 255, cv2.THRESH_BINARY_INV
         )[1]
-        preserved_ink = cv2.bitwise_and(binary_clean, strong_ink)
+        # Do not restore an entire blue/purple notebook rule merely because it
+        # shares the pen hue. Preserve colored pixels only near vertical or
+        # curved character-body evidence; a horizontal stationery line has no
+        # such support away from actual handwriting crossings.
+        character_support = cv2.morphologyEx(
+            binary_clean,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (1, max(5, int(rows * 0.004))),
+            ),
+        )
+        character_neighborhood = cv2.dilate(
+            character_support,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (
+                    max(7, int(cols * 0.008)),
+                    max(7, int(rows * 0.006)),
+                ),
+            ),
+            iterations=1,
+        )
+        protected_colored_ink = cv2.bitwise_and(
+            colored_ink,
+            character_neighborhood,
+        )
+        preserved_ink = cv2.bitwise_and(
+            binary_clean,
+            cv2.bitwise_or(strong_ink, protected_colored_ink),
+        )
         # A dark photographed page edge is also "strong ink" but must not be
         # restored after Hough removal. Protect handwriting only in the page
         # interior so borders cannot reconnect otherwise separate text rows.
@@ -450,16 +512,45 @@ def segment_document(original_image: np.ndarray, binary_image: np.ndarray) -> Tu
         )
     return regions, overlay
 
-def remove_background(image: np.ndarray, binary_image: np.ndarray) -> np.ndarray:
+def normalize_document_background(
+    image: np.ndarray,
+    binary_image: np.ndarray,
+) -> np.ndarray:
+    """Render detected writing and diagrams as crisp ink on pure white.
+
+    Copying the original foreground colors retained paper shadows inside the
+    adaptive-threshold mask and left pale blue ink too faint for TrOCR. The
+    cleaned binary mask already contains only accepted handwriting/structure,
+    so render that evidence with a stable dark foreground instead. This gives
+    both TrOCR and the CNN the same high-contrast document while preserving the
+    original geometry and all detected diagram strokes.
     """
-    Remove background from the color BGR image:
-    1. Create a solid white background of the same shape.
-    2. Copy foreground color pixels from the original image where the binary mask is 255.
-    """
-    clean_image = np.ones_like(image) * 255
-    mask = (binary_image == 255)
-    clean_image[mask] = image[mask]
+    if image is None or image.size == 0:
+        return np.empty((0, 0, 3), dtype=np.uint8)
+    if binary_image is None or binary_image.shape[:2] != image.shape[:2]:
+        raise ValueError("binary mask must match the source document dimensions")
+
+    mask = (binary_image > 0).astype(np.uint8) * 255
+    # Remove isolated camera/sensor specks without deleting punctuation or the
+    # dot above a handwritten i. At phone resolution, real marks normally have
+    # at least two connected pixels.
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (mask > 0).astype(np.uint8),
+        connectivity=8,
+    )
+    accepted = np.zeros_like(mask)
+    for component in range(1, component_count):
+        if int(stats[component, cv2.CC_STAT_AREA]) >= 2:
+            accepted[labels == component] = 255
+
+    clean_image = np.full_like(image, 255)
+    clean_image[accepted > 0] = (12, 12, 12)
     return clean_image
+
+
+def remove_background(image: np.ndarray, binary_image: np.ndarray) -> np.ndarray:
+    """Backward-compatible alias for the normalized white-page renderer."""
+    return normalize_document_background(image, binary_image)
 
 
 def digitize_diagram(binary_crop: np.ndarray) -> np.ndarray:

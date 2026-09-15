@@ -1,16 +1,24 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import models
-from database import engine, Base, ensure_history_summary_column
-import routers.users
-import routers.upload
-import routers.history
+
+from . import models
+from .database import Base, engine, ensure_history_summary_column
+from .routers import history, upload, users
+from .services.ocr_runtime import start_ocr_model_warmup
 
 # Create database tables if they do not exist
 Base.metadata.create_all(bind=engine)
 ensure_history_summary_column()
 
-app = FastAPI(title="Handwritten Digitizer API")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    start_ocr_model_warmup()
+    yield
+
+
+app = FastAPI(title="Handwritten Digitizer API", lifespan=lifespan)
 
 # Enable CORS for Flutter frontend clients (Android emulator, Web, etc.)
 app.add_middleware(
@@ -22,9 +30,9 @@ app.add_middleware(
 )
 
 # Include API module routers
-app.include_router(routers.users.router)
-app.include_router(routers.upload.router)
-app.include_router(routers.history.router)
+app.include_router(users.router)
+app.include_router(upload.router)
+app.include_router(history.router)
 
 @app.get("/")
 def home():

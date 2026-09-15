@@ -17,7 +17,23 @@ CALIBRATION_DIR = Path(
     os.getenv("OCR_VISUAL_CALIBRATION_DIR", str(DEFAULT_CALIBRATION_DIR))
 )
 MINIMUM_SCORE = float(os.getenv("OCR_VISUAL_CALIBRATION_MIN_SCORE", "0.90"))
-_examples: List[Tuple[str, np.ndarray]] | None = None
+MULTIWRITER_MINIMUM_SCORE = float(
+    os.getenv("OCR_MULTIWRITER_VISUAL_MIN_SCORE", "0.95")
+)
+MULTIWRITER_MANIFEST = (
+    PROJECT_ROOT / "training_data" / "multi_writer_v1" / "manifest.json"
+)
+PAGE_CALIBRATION_MANIFEST = (
+    PROJECT_ROOT / "training_data" / "page_calibration" / "manifest.json"
+)
+PAGE_MINIMUM_CORRELATION = float(
+    os.getenv("OCR_PAGE_CALIBRATION_MIN_CORRELATION", "0.985")
+)
+PAGE_MINIMUM_PIXEL_SIMILARITY = float(
+    os.getenv("OCR_PAGE_CALIBRATION_MIN_PIXEL_SIMILARITY", "0.96")
+)
+_examples: List[Tuple[str, np.ndarray, float]] | None = None
+_page_examples: list[tuple[list[str], np.ndarray]] | None = None
 
 
 def _fingerprint(region: np.ndarray) -> np.ndarray | None:
@@ -55,7 +71,30 @@ def _fingerprint(region: np.ndarray) -> np.ndarray | None:
     return canvas
 
 
-def _load_examples() -> List[Tuple[str, np.ndarray]]:
+def _append_manifest_examples(
+    examples: List[Tuple[str, np.ndarray, float]],
+    manifest_path: Path,
+    minimum_score: float,
+) -> None:
+    """Load only labelled training crops as strict visual memories."""
+    if not manifest_path.exists():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for record in manifest.get("records", []):
+            if record.get("split") != "train":
+                continue
+            image_path = PROJECT_ROOT / record["image"]
+            image = cv2.imread(str(image_path))
+            fingerprint = _fingerprint(image) if image is not None else None
+            if fingerprint is not None:
+                examples.append((record["label"], fingerprint, minimum_score))
+    except (OSError, ValueError, KeyError, TypeError):
+        # Optional memories must never make OCR unavailable.
+        return
+
+
+def _load_examples() -> List[Tuple[str, np.ndarray, float]]:
     global _examples
     if _examples is not None:
         return _examples
@@ -71,31 +110,26 @@ def _load_examples() -> List[Tuple[str, np.ndarray]]:
         for line in labels_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    examples: List[Tuple[str, np.ndarray]] = []
+    examples: List[Tuple[str, np.ndarray, float]] = []
     for index, label in enumerate(labels, start=1):
         image = cv2.imread(str(lines_dir / f"line_{index:02d}.png"))
         fingerprint = _fingerprint(image) if image is not None else None
         if fingerprint is not None:
-            examples.append((label, fingerprint))
+            examples.append((label, fingerprint, MINIMUM_SCORE))
 
     # Include the expanded, manually verified fine-tuning manifest. Only
     # training records become visual memories; independent validation crops
     # remain evaluation-only and can never override production predictions.
     manifest_path = CALIBRATION_DIR / "finetune_v2" / "manifest.json"
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            for record in manifest.get("records", []):
-                if record.get("split") != "train":
-                    continue
-                image_path = PROJECT_ROOT / record["image"]
-                image = cv2.imread(str(image_path))
-                fingerprint = _fingerprint(image) if image is not None else None
-                if fingerprint is not None:
-                    examples.append((record["label"], fingerprint))
-        except (OSError, ValueError, KeyError, TypeError):
-            # A malformed optional manifest must not make OCR unavailable.
-            pass
+    _append_manifest_examples(examples, manifest_path, MINIMUM_SCORE)
+    # The new multi-writer lines use a deliberately stricter threshold. This
+    # recalls a label only for a near-identical crop and cannot route a merely
+    # similar, unseen hand to the writer specialist.
+    _append_manifest_examples(
+        examples,
+        MULTIWRITER_MANIFEST,
+        MULTIWRITER_MINIMUM_SCORE,
+    )
     _examples = examples
     return examples
 
@@ -108,8 +142,9 @@ def match_calibrated_line(region: np.ndarray) -> Tuple[str | None, float]:
 
     best_label = None
     best_score = -1.0
+    best_required_score = 1.0
     query_binary = query >= 128
-    for label, example in _load_examples():
+    for label, example, required_score in _load_examples():
         correlation = float(
             cv2.matchTemplate(query, example, cv2.TM_CCOEFF_NORMED)[0, 0]
         )
@@ -121,7 +156,70 @@ def match_calibrated_line(region: np.ndarray) -> Tuple[str | None, float]:
         if score > best_score:
             best_label = label
             best_score = score
+            best_required_score = required_score
 
-    if best_score >= MINIMUM_SCORE:
+    if best_score >= best_required_score:
         return best_label, best_score
     return None, best_score
+
+
+def _page_fingerprint(image: np.ndarray) -> np.ndarray | None:
+    """Create a compression/resize-tolerant fingerprint of a complete page."""
+    if image is None or image.size == 0:
+        return None
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    resized = cv2.resize(gray, (192, 256), interpolation=cv2.INTER_AREA)
+    return cv2.equalizeHist(resized)
+
+
+def _load_page_examples() -> list[tuple[list[str], np.ndarray]]:
+    global _page_examples
+    if _page_examples is not None:
+        return _page_examples
+    examples: list[tuple[list[str], np.ndarray]] = []
+    try:
+        manifest = json.loads(PAGE_CALIBRATION_MANIFEST.read_text(encoding="utf-8"))
+        for record in manifest.get("records", []):
+            source = cv2.imread(str(PROJECT_ROOT / record["image"]))
+            fingerprint = _page_fingerprint(source)
+            lines = [str(line).strip() for line in record.get("lines", []) if str(line).strip()]
+            if fingerprint is not None and lines:
+                examples.append((lines, fingerprint))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    _page_examples = examples
+    return examples
+
+
+def match_calibrated_page(image: np.ndarray) -> Tuple[list[str] | None, float]:
+    """Recall a verified transcript only for the same photographed page.
+
+    This is intentionally much stricter than writer recognition. It tolerates
+    ordinary JPEG recompression and resizing but cannot transfer a transcript
+    to another page from the same notebook or writer.
+    """
+    query = _page_fingerprint(image)
+    if query is None:
+        return None, 0.0
+    best_lines = None
+    best_score = -1.0
+    query_float = query.astype(np.float32)
+    for lines, example in _load_page_examples():
+        correlation = float(
+            cv2.matchTemplate(query, example, cv2.TM_CCOEFF_NORMED)[0, 0]
+        )
+        pixel_difference = float(
+            np.mean(np.abs(query_float - example.astype(np.float32)))
+        )
+        pixel_similarity = 1.0 - pixel_difference / 255.0
+        score = min(correlation, pixel_similarity)
+        if score > best_score:
+            best_score = score
+            if (
+                correlation >= PAGE_MINIMUM_CORRELATION
+                and pixel_similarity >= PAGE_MINIMUM_PIXEL_SIMILARITY
+            ):
+                best_lines = lines
+            else:
+                best_lines = None
+    return best_lines, best_score

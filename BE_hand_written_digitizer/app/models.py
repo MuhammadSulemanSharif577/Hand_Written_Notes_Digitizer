@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
-from database import Base
+from .database import Base
 
 class User(Base):
     __tablename__ = "users"
@@ -39,7 +39,7 @@ class SegmentedRegion(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     history_id = Column(Integer, ForeignKey("history.id", ondelete="CASCADE"), nullable=False)
     region_type = Column(String(50), nullable=False)  # "text" or "diagram"
-    image_url = Column(Text, nullable=False)  # Cloudinary URL for the cropped region
+    image_url = Column(Text, nullable=False)
     x = Column(Integer, nullable=False)
     y = Column(Integer, nullable=False)
     width = Column(Integer, nullable=False)

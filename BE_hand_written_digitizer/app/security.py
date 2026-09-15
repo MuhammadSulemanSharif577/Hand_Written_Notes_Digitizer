@@ -6,8 +6,8 @@ from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
-from database import SessionLocal
-import models
+from . import models
+from .database import SessionLocal
 
 # Secret keys and configuration
 SECRET_KEY = os.getenv("JWT_SECRET", "supersecretkeyforhandwritingdigitizer12345!")

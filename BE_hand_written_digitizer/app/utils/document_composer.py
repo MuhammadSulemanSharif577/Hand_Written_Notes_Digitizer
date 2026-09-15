@@ -1,106 +1,143 @@
-import os
+"""Build downloadable documents without discarding the source handwriting."""
+
 import io
+
 import requests
 from PIL import Image
 from docx import Document
 from docx.shared import Inches
 from fpdf import FPDF
 
+
+_DOWNLOAD_TIMEOUT_SECONDS = 15
+
+
+def _download_image(url: str | None) -> Image.Image | None:
+    """Download an image and detach it from the response byte stream."""
+    if not url:
+        return None
+    try:
+        response = requests.get(url, timeout=_DOWNLOAD_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        with Image.open(io.BytesIO(response.content)) as source:
+            return source.convert("RGB")
+    except (requests.RequestException, OSError):
+        return None
+
+
+def _image_stream(image: Image.Image) -> io.BytesIO:
+    stream = io.BytesIO()
+    image.save(stream, format="PNG")
+    stream.seek(0)
+    return stream
+
+
+def _add_fitted_pdf_image(pdf: FPDF, image: Image.Image) -> None:
+    """Place an image on the current page without stretching or cropping it."""
+    margin = 10.0
+    available_width = pdf.w - (2 * margin)
+    available_height = pdf.h - (2 * margin)
+    scale = min(available_width / image.width, available_height / image.height)
+    width = image.width * scale
+    height = image.height * scale
+    x = (pdf.w - width) / 2
+    y = (pdf.h - height) / 2
+    pdf.image(_image_stream(image), x=x, y=y, w=width, h=height)
+
+
 def generate_docx(history_record) -> io.BytesIO:
-    """
-    Compiles digitized text and shapes from a scan history record
-    into a clean Microsoft Word (DOCX) document stream.
-    """
+    """Create a DOCX containing the complete original and typed OCR text."""
     doc = Document()
-    
-    # Document title
     doc.add_heading(f"Digitized Document: Scan #{history_record.id}", 0)
-    
-    # Add Extracted Text
-    doc.add_heading("Extracted Text", level=1)
-    doc.add_paragraph(history_record.extracted_text or "No text extracted.")
-    
-    # Add Diagrams
-    diagram_regions = [r for r in history_record.segmented_regions if r.region_type == "diagram"]
+
+    # The source page is deliberately included before OCR. A low-confidence
+    # model prediction must never make handwriting disappear from an export.
+    original = _download_image(getattr(history_record, "image_url", None))
+    if original is not None:
+        doc.add_heading("Original Document", level=1)
+        doc.add_picture(_image_stream(original), width=Inches(6.2))
+        doc.add_page_break()
+
+    doc.add_heading("Typed Transcription", level=1)
+    doc.add_paragraph(history_record.extracted_text or "No reliable text extracted.")
+
+    diagram_regions = [
+        region
+        for region in (getattr(history_record, "segmented_regions", None) or [])
+        if region.region_type == "diagram"
+    ]
     if diagram_regions:
-        doc.add_heading("Digitized Diagrams", level=1)
-        for idx, region in enumerate(diagram_regions):
-            doc.add_heading(f"Diagram #{idx+1}", level=2)
-            try:
-                # Fetch shape image from Cloudinary
-                resp = requests.get(region.image_url, timeout=15)
-                if resp.status_code == 200:
-                    image_bytes = io.BytesIO(resp.content)
-                    doc.add_picture(image_bytes, width=Inches(4.5))
-                else:
-                    doc.add_paragraph(f"[Failed to load diagram image from {region.image_url}]")
-            except Exception as e:
-                doc.add_paragraph(f"[Error fetching diagram: {str(e)}]")
-                
+        doc.add_heading("Detected Diagrams", level=1)
+        for index, region in enumerate(diagram_regions, start=1):
+            doc.add_heading(f"Diagram #{index}", level=2)
+            diagram = _download_image(region.image_url)
+            if diagram is not None:
+                doc.add_picture(_image_stream(diagram), width=Inches(4.5))
+            else:
+                doc.add_paragraph("[Diagram image could not be loaded]")
+
     file_stream = io.BytesIO()
     doc.save(file_stream)
     file_stream.seek(0)
     return file_stream
 
+
 def generate_pdf(history_record) -> io.BytesIO:
-    """
-    Compiles digitized text and shapes from a scan history record
-    into a formatted PDF document stream using fpdf2.
-    """
+    """Create a PDF whose first page preserves the full uploaded photograph."""
     pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    original = _download_image(getattr(history_record, "image_url", None))
+    if original is not None:
+        pdf.add_page()
+        _add_fitted_pdf_image(pdf, original)
+
+    # OCR is an additional typed transcription, never a destructive
+    # replacement for the original document.
     pdf.add_page()
-    
-    # Set default encoding safe font
-    pdf.set_font("Helvetica", size=12)
-    
-    # Document Title
     pdf.set_font("Helvetica", style="B", size=16)
-    pdf.cell(0, 10, txt=f"Digitized Document: Scan #{history_record.id}", ln=True, align="C")
-    pdf.ln(10)
-    
-    # Extracted Text Section
+    pdf.cell(0, 10, text=f"Digitized Document: Scan #{history_record.id}", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(8)
     pdf.set_font("Helvetica", style="B", size=14)
-    pdf.cell(0, 10, txt="Extracted Text", ln=True)
+    pdf.cell(0, 10, text="Typed Transcription", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(2)
-    
+
     pdf.set_font("Helvetica", size=11)
-    text_content = history_record.extracted_text or "No text extracted."
-    # Replace non-latin1 characters with standard placeholders to avoid fpdf2 encoding errors
+    text_content = history_record.extracted_text or "No reliable text extracted."
     text_latin1 = text_content.encode("latin-1", "replace").decode("latin-1")
-    pdf.multi_cell(0, 8, txt=text_latin1)
-    pdf.ln(10)
-    
-    # Diagrams Section
-    diagram_regions = [r for r in history_record.segmented_regions if r.region_type == "diagram"]
+    pdf.multi_cell(0, 8, text=text_latin1)
+    pdf.ln(8)
+
+    diagram_regions = [
+        region
+        for region in (getattr(history_record, "segmented_regions", None) or [])
+        if region.region_type == "diagram"
+    ]
     if diagram_regions:
         pdf.set_font("Helvetica", style="B", size=14)
-        pdf.cell(0, 10, txt="Digitized Diagrams", ln=True)
-        pdf.ln(5)
-        for idx, region in enumerate(diagram_regions):
+        pdf.cell(0, 10, text="Detected Diagrams", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(4)
+        for index, region in enumerate(diagram_regions, start=1):
             pdf.set_font("Helvetica", style="B", size=11)
-            pdf.cell(0, 8, txt=f"Diagram #{idx+1}", ln=True)
-            pdf.ln(2)
-            try:
-                # Fetch shape image from Cloudinary
-                resp = requests.get(region.image_url, timeout=15)
-                if resp.status_code == 200:
-                    img_data = io.BytesIO(resp.content)
-                    img = Image.open(img_data)
-                    
-                    # Convert to RGB mode if image is RGBA to prevent transparency format errors in PDF
-                    if img.mode == 'RGBA':
-                        img = img.convert('RGB')
-                        
-                    pdf.image(img, w=150)
-                    pdf.ln(10)
-                else:
-                    pdf.set_font("Helvetica", style="I", size=10)
-                    pdf.cell(0, 8, txt="[Failed to load diagram image]", ln=True)
-            except Exception as e:
+            pdf.cell(0, 8, text=f"Diagram #{index}", new_x="LMARGIN", new_y="NEXT")
+            diagram = _download_image(region.image_url)
+            if diagram is None:
                 pdf.set_font("Helvetica", style="I", size=10)
-                pdf.cell(0, 8, txt=f"[Error loading diagram: {str(e)}]", ln=True)
-                pdf.ln(5)
-                
+                pdf.cell(0, 8, text="[Diagram image could not be loaded]", new_x="LMARGIN", new_y="NEXT")
+                continue
+
+            # Keep diagrams within the printable width and reserve space for
+            # a heading on the following page when necessary.
+            max_width = pdf.w - pdf.l_margin - pdf.r_margin
+            max_height = 120.0
+            scale = min(max_width / diagram.width, max_height / diagram.height)
+            width = diagram.width * scale
+            height = diagram.height * scale
+            if pdf.get_y() + height > pdf.h - pdf.b_margin:
+                pdf.add_page()
+            pdf.image(_image_stream(diagram), x=pdf.l_margin, y=pdf.get_y(), w=width, h=height)
+            pdf.set_y(pdf.get_y() + height + 8)
+
     pdf_bytes = pdf.output()
     if isinstance(pdf_bytes, bytearray):
         pdf_bytes = bytes(pdf_bytes)

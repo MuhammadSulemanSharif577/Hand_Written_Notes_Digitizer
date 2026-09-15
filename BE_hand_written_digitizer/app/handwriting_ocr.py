@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import logging
 import os
-import json
+import threading
 from typing import List, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
+
+try:
+    from .ocr_model_policy import is_safe_general_checkpoint
+except ImportError:  # Support the legacy top-level ``app`` import path.
+    from ocr_model_policy import is_safe_general_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -37,21 +42,9 @@ _LOCAL_FINE_TUNED_MODEL_V3_DIR = os.path.abspath(
 )
 
 
-def _is_promoted_model(model_dir: str) -> bool:
-    marker = os.path.join(model_dir, "promotion.json")
-    weights = os.path.join(model_dir, "model.safetensors")
-    if not os.path.exists(marker) or not os.path.exists(weights):
-        return False
-    try:
-        with open(marker, "r", encoding="utf-8") as handle:
-            return bool(json.load(handle).get("promoted"))
-    except (OSError, ValueError):
-        return False
-
-
-if _is_promoted_model(_LOCAL_FINE_TUNED_MODEL_V3_DIR):
+if is_safe_general_checkpoint(_LOCAL_FINE_TUNED_MODEL_V3_DIR):
     _DEFAULT_MODEL = _LOCAL_FINE_TUNED_MODEL_V3_DIR
-elif _is_promoted_model(_LOCAL_FINE_TUNED_MODEL_DIR):
+elif is_safe_general_checkpoint(_LOCAL_FINE_TUNED_MODEL_DIR):
     _DEFAULT_MODEL = _LOCAL_FINE_TUNED_MODEL_DIR
 elif (
     os.path.exists(os.path.join(_LOCAL_CALIBRATED_MODEL_DIR, "model.safetensors"))
@@ -64,10 +57,37 @@ elif os.path.exists(os.path.join(_LOCAL_HANDWRITTEN_MODEL_DIR, "pytorch_model.bi
     _DEFAULT_MODEL = _LOCAL_HANDWRITTEN_MODEL_DIR
 else:
     _DEFAULT_MODEL = "microsoft/trocr-small-printed"
-MODEL_ID = os.getenv("HANDWRITING_OCR_MODEL", _DEFAULT_MODEL)
+
+
+def _resolve_requested_model() -> str:
+    requested = os.getenv("HANDWRITING_OCR_MODEL")
+    if not requested:
+        return _DEFAULT_MODEL
+    requested_path = os.path.abspath(requested)
+    comparison_path = os.path.join(requested_path, "comparison.json")
+    allow_unsafe = os.getenv("OCR_ALLOW_UNSAFE_MODEL", "").lower() in {
+        "1", "true", "yes",
+    }
+    if (
+        os.path.isdir(requested_path)
+        and os.path.exists(comparison_path)
+        and not allow_unsafe
+        and not is_safe_general_checkpoint(requested_path)
+    ):
+        logger.warning(
+            "Ignoring unsafe general OCR checkpoint %s; set "
+            "OCR_ALLOW_UNSAFE_MODEL=1 only for an intentional specialist run",
+            requested_path,
+        )
+        return _DEFAULT_MODEL
+    return requested
+
+
+MODEL_ID = _resolve_requested_model()
 _processor = None
 _model = None
 _load_error: Exception | None = None
+_load_lock = threading.Lock()
 
 
 def _load_model():
@@ -78,30 +98,46 @@ def _load_model():
     if _load_error is not None:
         raise RuntimeError("Handwriting OCR model is unavailable") from _load_error
 
-    try:
-        # TensorFlow is already loaded by the existing CNN service. Limit
-        # PyTorch/OpenMP thread pools to avoid Windows DLL contention and keep
-        # CPU inference predictable in the same FastAPI process.
-        os.environ.setdefault("OMP_NUM_THREADS", "1")
-        os.environ.setdefault("MKL_NUM_THREADS", "1")
-        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-        import torch
-        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+    with _load_lock:
+        if _processor is not None and _model is not None:
+            return _processor, _model
+        if _load_error is not None:
+            raise RuntimeError("Handwriting OCR model is unavailable") from _load_error
 
-        torch.set_num_threads(1)
+        try:
+            # Keep the thread count conservative enough for a mixed
+            # TensorFlow/PyTorch process, but do not force CPU inference onto a
+            # single core. This changes execution speed, not model output.
+            default_threads = min(4, max(1, os.cpu_count() or 1))
+            thread_count = max(
+                1,
+                int(os.getenv("OCR_TORCH_THREADS", str(default_threads))),
+            )
+            os.environ.setdefault("OMP_NUM_THREADS", str(thread_count))
+            os.environ.setdefault("MKL_NUM_THREADS", str(thread_count))
+            os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+            import torch
+            from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
-        _processor = TrOCRProcessor.from_pretrained(MODEL_ID, use_fast=False)
-        _model = VisionEncoderDecoderModel.from_pretrained(MODEL_ID)
-        _model.to(torch.device("cpu"))
-        _model.eval()
-        return _processor, _model
-    except Exception as exc:  # pragma: no cover - depends on local model/cache
-        _load_error = exc
-        logger.exception("Unable to load handwriting OCR model '%s'", MODEL_ID)
-        raise RuntimeError(
-            "Handwriting OCR model could not be loaded. "
-            "The CNN fallback will be used."
-        ) from exc
+            torch.set_num_threads(thread_count)
+
+            _processor = TrOCRProcessor.from_pretrained(MODEL_ID, use_fast=False)
+            _model = VisionEncoderDecoderModel.from_pretrained(MODEL_ID)
+            _model.to(torch.device("cpu"))
+            _model.eval()
+            return _processor, _model
+        except Exception as exc:  # pragma: no cover - depends on local model/cache
+            _load_error = exc
+            logger.exception("Unable to load handwriting OCR model '%s'", MODEL_ID)
+            raise RuntimeError(
+                "Handwriting OCR model could not be loaded. "
+                "The CNN fallback will be used."
+            ) from exc
+
+
+def warmup_handwriting_model() -> None:
+    """Load TrOCR ahead of the first upload without running inference."""
+    _load_model()
 
 
 def _region_to_pil(region: np.ndarray) -> Image.Image:
@@ -145,7 +181,13 @@ def recognize_lines_with_confidence(
     with torch.inference_mode():
         generated = model.generate(
             pixel_values,
-            max_new_tokens=48,
+            # The production pipeline supplies word-sized crops. Limiting the
+            # decoder prevents a malformed/noise crop from autoregressively
+            # hallucinating dozens of tokens and stalling the whole request.
+            max_new_tokens=max(
+                4,
+                int(os.getenv("OCR_MAX_NEW_TOKENS", "16")),
+            ),
             num_beams=1,
             return_dict_in_generate=True,
             output_scores=True,

@@ -51,3 +51,16 @@ Each candidate writes `comparison.json`, `promotion.json`, a confusion heatmap,
 macro/micro/weighted precision-recall-F1 chart, character CSV, and training
 history. Production selects a candidate only when `promotion.json` confirms
 that independent validation and target-domain safeguards passed.
+
+## Production checkpoint safety
+
+`app/ocr_model_policy.py` prevents a writer specialist from becoming the
+universal OCR checkpoint when it regresses on held-out handwriting. A general
+checkpoint must be promoted and must not worsen validation CER, WER,
+exact-line accuracy, character accuracy, or weighted F1. The current runtime
+therefore uses `trocr-writer-calibrated-v3`; the multi-writer checkpoint stays
+available as a specialist only.
+
+An explicitly requested local checkpoint that fails this policy is ignored.
+`OCR_ALLOW_UNSAFE_MODEL=1` bypasses the guard for controlled evaluation only
+and should not be set in the production API environment.

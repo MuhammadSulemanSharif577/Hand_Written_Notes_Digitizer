@@ -242,3 +242,108 @@ def segment_characters(binary_region: np.ndarray) -> List[List[Box]]:
         key=lambda line: np.median([box[1] + box[3] / 2 for box in line]),
     )
 
+
+def segment_words(binary_line: np.ndarray) -> List[Box]:
+    """Group handwriting components into left-to-right word boxes.
+
+    TrOCR's IAM handwriting checkpoints work best on word-sized crops. A full
+    notebook line can be ten or more times wider than it is tall and becomes
+    unreadably compressed when the vision processor resizes it to a square.
+    """
+    if binary_line is None or binary_line.size == 0:
+        return []
+    if binary_line.ndim == 3:
+        binary_line = cv2.cvtColor(binary_line, cv2.COLOR_BGR2GRAY)
+
+    height, width = binary_line.shape[:2]
+    contours, _ = cv2.findContours(
+        binary_line, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    components: List[Box] = []
+    for contour in contours:
+        x, y, component_width, component_height = cv2.boundingRect(contour)
+        if cv2.contourArea(contour) < 2 or component_width < 2:
+            continue
+        if component_height < max(2, int(height * 0.08)):
+            continue
+        is_rule_residue = (
+            component_width > width * 0.40
+            and component_height <= max(3, int(height * 0.12))
+        )
+        if not is_rule_residue:
+            components.append((x, y, component_width, component_height))
+    if not components:
+        return []
+
+    components = merge_overlapping_boxes(components, overlap_threshold=0.30)
+    components.sort(key=lambda box: box[0])
+    body_heights = [box[3] for box in components]
+    reference_height = float(np.median(body_heights)) if body_heights else height
+    # Inter-character gaps in connected or semi-connected handwriting are
+    # normally below half a character body. Notebook word spaces are wider.
+    word_gap = max(7, int(reference_height * 0.55), int(height * 0.38))
+
+    # A ruled-paper line can touch several letters and turn an entire sentence
+    # into one external contour. Use columns with real character-body density
+    # instead: a residual rule contributes only one or two pixels per column.
+    column_counts = np.count_nonzero(binary_line, axis=0)
+    dense_columns = np.flatnonzero(
+        column_counts >= max(3, int(height * 0.10))
+    )
+    column_runs: List[Tuple[int, int]] = []
+    for column in dense_columns:
+        column = int(column)
+        if not column_runs or column > column_runs[-1][1] + 1:
+            column_runs.append((column, column))
+        else:
+            column_runs[-1] = (column_runs[-1][0], column)
+
+    grouped_runs: List[List[Tuple[int, int]]] = []
+    for run in column_runs:
+        if not grouped_runs or run[0] - grouped_runs[-1][-1][1] - 1 > word_gap:
+            grouped_runs.append([run])
+        else:
+            grouped_runs[-1].append(run)
+
+    # Fall back to contour grouping only for exceptionally faint words whose
+    # vertical/curved strokes never meet the body-density threshold.
+    if grouped_runs:
+        horizontal_groups = [
+            (group[0][0], group[-1][1] + 1)
+            for group in grouped_runs
+        ]
+    else:
+        horizontal_groups = []
+        current_start = components[0][0]
+        current_end = components[0][0] + components[0][2]
+        for x, _, component_width, _ in components[1:]:
+            if x - current_end > word_gap:
+                horizontal_groups.append((current_start, current_end))
+                current_start = x
+            current_end = max(current_end, x + component_width)
+        horizontal_groups.append((current_start, current_end))
+
+    padding_x = max(3, int(height * 0.12))
+    padding_y = max(2, int(height * 0.10))
+    words: List[Box] = []
+    for group_start, group_end in horizontal_groups:
+        minimum_core_width = max(4, int(height * 0.22))
+        if group_end - group_start < minimum_core_width:
+            # Spiral binding, isolated page dirt, and detached rule fragments
+            # commonly appear as tiny far-right "words".
+            continue
+        search_x0 = max(0, group_start - padding_x)
+        search_x1 = min(width, group_end + padding_x)
+        word_mask = binary_line[:, search_x0:search_x1]
+        coordinates = cv2.findNonZero(word_mask)
+        if coordinates is None:
+            continue
+        local_x, local_y, word_width, word_height = cv2.boundingRect(coordinates)
+        x0 = max(0, search_x0 + local_x - padding_x)
+        y0 = max(0, local_y - padding_y)
+        x1 = min(width, search_x0 + local_x + word_width + padding_x)
+        y1 = min(height, local_y + word_height + padding_y)
+        minimum_word_width = max(5, int(height * 0.25))
+        if x1 - x0 >= minimum_word_width and y1 - y0 >= 5:
+            words.append((x0, y0, x1 - x0, y1 - y0))
+    return words
